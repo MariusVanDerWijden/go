@@ -684,13 +684,30 @@ func (z nat) expNN(stk *stack, x, y, m nat, slow bool) nat {
 			}
 			return z.expNNMontgomeryEven(stk, x, y, m)
 		}
+		// For single-limb exponents, use optimized methods
+		if !slow {
+			// Special case: single-word modulus
+			if len(m) == 1 && len(y) == 1 {
+				return z.expNNWordMod(stk, x, y[0], m[0])
+			}
+
+			// Try Montgomery multiplication for odd moduli with single-limb exponents
+			if len(m) > 0 && len(y) == 1 && m[0]&1 == 1 {
+				return z.expNNMontgomerySingle(stk, x, y, m)
+			}
+		}
+		// Fall through to basic binary implementation when slow=true or no optimization applies
 	}
 
+	// Basic binary method (for slow=true or non-modular case)
 	z = z.set(x)
+	// If we have a modulus and x >= m, reduce x first
+	if len(m) != 0 && x.cmp(m) >= 0 {
+		z = z.rem(stk, x, m)
+	}
 	v := y[len(y)-1] // v > 0 because y is normalized and y > 0
 	shift := nlz(v) + 1
 	v <<= shift
-	var q nat
 
 	const mask = 1 << (_W - 1)
 
@@ -713,7 +730,7 @@ func (z nat) expNN(stk *stack, x, y, m nat, slow bool) nat {
 
 		if len(m) != 0 {
 			zz, r = zz.div(stk, r, z, m)
-			zz, r, q, z = q, z, zz, r
+			zz, r, z = z, zz, r
 		}
 
 		v <<= 1
@@ -733,7 +750,7 @@ func (z nat) expNN(stk *stack, x, y, m nat, slow bool) nat {
 
 			if len(m) != 0 {
 				zz, r = zz.div(stk, r, z, m)
-				zz, r, q, z = q, z, zz, r
+				zz, r, z = z, zz, r
 			}
 
 			v <<= 1
@@ -973,6 +990,152 @@ func (z nat) expNNMontgomery(stk *stack, x, y, m nat) nat {
 		if zz.cmp(m) >= 0 {
 			_, zz = nat(nil).div(stk, nil, zz, m)
 		}
+	}
+
+	return zz.norm()
+}
+
+// expNNWordMod computes x**y mod m where both y and m are single words.
+// This is optimized for the common case of small moduli.
+func (z nat) expNNWordMod(stk *stack, x nat, y Word, m Word) nat {
+	// Handle special cases
+	if y == 0 {
+		return z.setWord(1)
+	}
+	if m == 1 {
+		return z.setWord(0)
+	}
+
+	// To avoid overflow, only use Word arithmetic for small moduli
+	// where we know (m-1)^2 < 2^64
+	if m > 1<<32 {
+		// Fall back to regular method for large moduli
+		return z.expNN(stk, x, nat{y}, nat{m}, true)
+	}
+
+	// Reduce x mod m if needed
+	var base Word
+	if len(x) == 0 {
+		return z.setWord(0)
+	} else if len(x) == 1 {
+		base = x[0] % m
+	} else {
+		// x has multiple words, need full reduction
+		_, remainder := nat(nil).div(stk, nil, x, nat{m})
+		if len(remainder) == 0 {
+			base = 0
+		} else {
+			base = remainder[0]
+		}
+	}
+
+	// Fast exponentiation with Word arithmetic
+	result := Word(1)
+	for y > 0 {
+		if y&1 == 1 {
+			result = (result * base) % m
+		}
+		base = (base * base) % m
+		y >>= 1
+	}
+
+	return z.setWord(result)
+}
+
+// expNNMontgomerySingle computes x**y mod m using Montgomery multiplication,
+// optimized for single-limb exponents.
+func (z nat) expNNMontgomerySingle(stk *stack, x, y, m nat) nat {
+	numWords := len(m)
+
+	// Handle special cases
+	if len(x) == 0 || x.cmp(natOne) == 0 {
+		// x^y = 0 for x=0, x^y = 1 for x=1
+		return z.set(x)
+	}
+
+	// For very small moduli or when Montgomery setup might fail,
+	// fall back to regular method
+	if numWords == 0 || (numWords == 1 && m[0] < 4) {
+		// Fall back for tiny moduli
+		return z.expNN(stk, x, y, m, true)
+	}
+
+	// Reduce x if needed
+	if len(x) > numWords {
+		_, x = nat(nil).div(stk, nil, x, m)
+	}
+	if len(x) < numWords {
+		rr := make(nat, numWords)
+		copy(rr, x)
+		x = rr
+	}
+
+	// Compute k0 = -m^(-1) mod 2^_W
+	k0 := 2 - m[0]
+	t := m[0] - 1
+	for i := 1; i < _W; i <<= 1 {
+		t *= t
+		k0 *= (t + 1)
+	}
+	k0 = -k0
+
+	// RR = 2^(2*_W*len(m)) mod m
+	RR := nat(nil).setWord(1)
+	zz := nat(nil).lsh(RR, uint(2*numWords*_W))
+	_, RR = nat(nil).div(stk, RR, zz, m)
+	if len(RR) < numWords {
+		zz = zz.make(numWords)
+		copy(zz, RR)
+		RR = zz
+	}
+
+	// Check if R ≡ 1 (mod m), which means RR ≡ 1 (mod m)
+	// In this case, Montgomery form degenerates and we should use regular method
+	if len(RR) == 1 && RR[0] == 1 {
+		// R = 1, so Montgomery multiplication won't work properly
+		// Fall back to regular binary method
+		return z.expNN(stk, x, y, m, true)
+	}
+
+	// Convert x to Montgomery form
+	x = nat(nil).montgomery(x, RR, m, k0, numWords)
+
+	// z = 1 in Montgomery form
+	// Montgomery form of 1 is R mod m, not RR
+	// We compute this by converting the regular 1 to Montgomery form
+	one := make(nat, numWords)
+	one[0] = 1
+	z = z.montgomery(one, RR, m, k0, numWords)
+
+	// Allocate temporary for montgomery operations
+	zz = zz.make(numWords)
+
+	// Process exponent bits using right-to-left binary method
+	ye := y[0]
+	base := x // Current power of x in Montgomery form
+
+	for ye > 0 {
+		if ye&1 == 1 {
+			// Multiply accumulator by current power of base
+			zz = zz.montgomery(z, base, m, k0, numWords)
+			zz, z = z, zz
+		}
+
+		ye >>= 1
+		if ye > 0 {
+			// Square the base for next bit position
+			zz = zz.montgomery(base, base, m, k0, numWords)
+			zz, base = base, zz
+		}
+	}
+
+	// Convert back from Montgomery form
+	// Reuse the 'one' variable from earlier
+	zz = zz.montgomery(z, one, m, k0, numWords)
+
+	// Final reduction if needed
+	if zz.cmp(m) >= 0 {
+		zz = zz.sub(zz, m)
 	}
 
 	return zz.norm()
